@@ -74,15 +74,10 @@ def latest_available_run(now: dt.datetime | None = None,
         if MODEL["source"].startswith("ecmwf"):
             ecmwf_explain(now, session)
         raise RuntimeError(f"No complete {MODEL['name']} run found in the last 48 h")
-    # GFS on NOMADS: a run is complete once its LAST hour's index file exists
-    last = MODEL["hours"][-1]
+    # GFS on NOMADS: usable once hour 240 is on the server (hours to 360 follow ~1 h later)
     for cand in _candidate_cycles(now):
-        url = NOMADS_IDX.format(ymd=cand.strftime("%Y%m%d"), hh=cand.strftime("%H")).replace("f000.idx", f"f{last:03d}.idx")
-        try:
-            if session.head(url, timeout=20).status_code == 200:
-                return cand
-        except requests.RequestException as e:
-            log.warning("HEAD %s failed: %s", url, e)
+        if run_max_hour(cand, session) is not None:
+            return cand
     raise RuntimeError("No GFS run found on NOMADS in the last 48 h")
 
 
@@ -133,9 +128,16 @@ def _probe_url(run: dt.datetime, step: int, session=None) -> str | None:
 def run_max_hour(run: dt.datetime, session: requests.Session | None = None) -> int | None:
     """Furthest forecast hour available for this run, or None if the run isn't
     complete at any known range. GFS is always the full range."""
-    if MODEL["source"] == "nomads":
-        return MODEL["hours"][-1]
     session = session or requests.Session()
+    if MODEL["source"] == "nomads":
+        for last in MODEL.get("probe_max_hours", [MODEL["hours"][-1]]):
+            url = NOMADS_IDX.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H")).replace("f000.idx", f"f{last:03d}.idx")
+            try:
+                if session.head(url, timeout=20).status_code == 200:
+                    return last
+            except requests.RequestException as e:
+                log.warning("HEAD %s failed: %s", url, e)
+        return None
     for last in MODEL.get("probe_max_hours", [MODEL["hours"][-1]]):
         if MODEL["source"] == "cmc":
             # also require the last 6-hourly step before the end, so a run whose
@@ -625,12 +627,12 @@ CMC_PATTERNS = {
 _CMC_TOKENS: dict | None = None
 
 
-def _listing(session, url, retries: int = 4):
+def _listing(session, url, retries: int = 4, timeout: int = 45):
     """href targets from an Apache-style directory index. The Datamart gets
     slow when many jobs hit it at once, so retry with backoff."""
     for attempt in range(retries):
         try:
-            r = session.get(url, timeout=90)
+            r = session.get(url, timeout=timeout)
             if r.status_code == 200:
                 return [h for h in re.findall(r'href="([^"?][^"]*)"', r.text) if not h.startswith("/")]
             if r.status_code == 404:
@@ -660,15 +662,16 @@ def cmc_tokens(run: dt.datetime, session: requests.Session | None = None) -> dic
         return _CMC_TOKENS
     session = session or requests.Session()
     ymd, hh = run.strftime("%Y%m%d"), run.strftime("%H")
+    # One quick attempt at the listing (to catch renames); the Datamart is often
+    # too busy to answer when 20 jobs start together, and we know the names anyway.
     names = set()
-    for step in (0, 6):
-        for f in _listing(session, CMC_DIR.format(ymd=ymd, hh=hh, fhr=step)):
-            m = re.match(r".*?_MSC_GDPS_(.+)_LatLon0\.15_PT\d{3}H\.grib2$", f)
-            if m:
-                names.add(m.group(1))
+    for f in _listing(session, CMC_DIR.format(ymd=ymd, hh=hh, fhr=6), retries=1, timeout=20):
+        m = re.match(r".*?_MSC_GDPS_(.+)_LatLon0\.15_PT\d{3}H\.grib2$", f)
+        if m:
+            names.add(m.group(1))
     tokens: dict = {}
     if not names:
-        log.warning("CMC: listing unavailable for %s %sZ; using known field names", ymd, hh)
+        log.info("CMC: listing not available quickly; using known field names")
         _CMC_TOKENS = dict(CMC_DEFAULT_TOKENS)
         return _CMC_TOKENS
     for field, pats in CMC_PATTERNS.items():
@@ -740,8 +743,8 @@ def geps_template(run: dt.datetime, session) -> dict:
         return _GEPS_TMPL
     ymd, hh = run.strftime("%Y%m%d"), run.strftime("%H")
     files = []
-    for step in (0, 6, 24):
-        files = [f for f in _listing(session, GEPS_DIR.format(ymd=ymd, hh=hh, fhr=step)) if f.endswith(".grib2")]
+    for step in (6, 24):
+        files = [f for f in _listing(session, GEPS_DIR.format(ymd=ymd, hh=hh, fhr=step), retries=1, timeout=20) if f.endswith(".grib2")]
         if files:
             break
     log.info("GEPS listing sample (%d files): %s", len(files), " ".join(files[:6]))
@@ -893,7 +896,7 @@ def download_files(run: dt.datetime, step: int, pairs: set, dest: Path, session:
         for url in urls:
             for attempt in range(retries):
                 try:
-                    r = session.get(url, timeout=180)
+                    r = session.get(url, timeout=60)
                     if r.status_code == 200 and len(r.content) > 500:
                         data = bz2.decompress(r.content) if url.endswith(".bz2") else r.content
                         out.write(data); got += 1
@@ -1057,8 +1060,12 @@ def normalise(f: "Fields", fhr: int = 0) -> "Fields":
         _, LAT = np.meshgrid(f.lon, f.lat)
         f["absv500"] = rel_vort(f["u500"], f["v500"], f.lon, f.lat) + 2 * 7.2921e-5 * np.sin(np.radians(LAT))
     if accum_from_zero:
-        if src == "ecmwf_opendata":                              # ECMWF tp is metres; CMC/ICON are mm
-            for k in [k for k in f if k.startswith("tp_acc")]:
+        # Units: ECMWF IFS (deterministic and ENS) publish tp in metres; CMC, ICON and AIFS
+        # in mm. Detect rather than assume: a run-total in mm exceeds 3 somewhere in any
+        # domain this size, a total in metres never does.
+        for k in [k for k in f if k.startswith("tp_acc")]:
+            mx = np.nanmax(f[k]) if np.isfinite(f[k]).any() else 0.0
+            if 0 < mx < 3.0:
                 f[k] = f[k] * 1000.0
         if "tp_acc" in f:
             prev = f.get("tp_acc_m6", np.zeros_like(f["tp_acc"]))
