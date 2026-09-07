@@ -74,9 +74,10 @@ def latest_available_run(now: dt.datetime | None = None,
         if MODEL["source"].startswith("ecmwf"):
             ecmwf_explain(now, session)
         raise RuntimeError(f"No complete {MODEL['name']} run found in the last 48 h")
-    # GFS on NOMADS: the f000 index file appears once the run is on the server
+    # GFS on NOMADS: a run is complete once its LAST hour's index file exists
+    last = MODEL["hours"][-1]
     for cand in _candidate_cycles(now):
-        url = NOMADS_IDX.format(ymd=cand.strftime("%Y%m%d"), hh=cand.strftime("%H"))
+        url = NOMADS_IDX.format(ymd=cand.strftime("%Y%m%d"), hh=cand.strftime("%H")).replace("f000.idx", f"f{last:03d}.idx")
         try:
             if session.head(url, timeout=20).status_code == 200:
                 return cand
@@ -273,7 +274,7 @@ def build_filter_url(run: dt.datetime, fhr: int, pairs: set[tuple[str, str]],
     return NOMADS_FILTER + "?" + urlencode(q, safe="\\()")
 
 
-BACKOFF = [5, 10, 20, 40, 60, 90]
+BACKOFF = [5, 10, 20, 30, 45, 60]
 
 
 def download(url: str, dest: Path, session: requests.Session, retries: int = 6) -> Path:
@@ -287,6 +288,8 @@ def download(url: str, dest: Path, session: requests.Session, retries: int = 6) 
             if r.status_code == 200 and len(r.content) > 1000:
                 dest.write_bytes(r.content)
                 return dest
+            if r.status_code == 404:                       # not there: retrying won't help
+                raise RuntimeError(f"404 {url}")
             log.warning("GET %s -> %s (%d bytes), attempt %d", url[:80], r.status_code, len(r.content), attempt + 1)
         except requests.RequestException as e:
             log.warning("GET failed (attempt %d): %s", attempt + 1, e)
@@ -300,8 +303,37 @@ def _group_of(lev: str) -> str:
     if lev.startswith("PV"):
         return "pv"
     if lev.startswith("top_of_atmosphere"):
-        return "toa"
+        return "toa"          # SBT brightness temps live in the pgrb2b file
     return "sfc"
+
+
+_DEAD_GROUPS: set = set()     # groups that failed with a server error this process; skip, don't keep retrying
+_SBT_FILE: str | None = None  # "a" (pgrb2) or "b" (pgrb2b), discovered from the .idx listings
+
+
+def sbt_file(run: dt.datetime, session) -> str | None:
+    """Which GFS file carries the SBT124 brightness temperature? Read NOAA's
+    .idx listings for both and log what they say, so the answer is in the log."""
+    global _SBT_FILE
+    if _SBT_FILE is not None:
+        return _SBT_FILE or None
+    ymd, hh = run.strftime("%Y%m%d"), run.strftime("%H")
+    base = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/gfs.{ymd}/{hh}/atmos/"
+    for tag, fname in (("a", f"gfs.t{hh}z.pgrb2.0p25.f006.idx"), ("b", f"gfs.t{hh}z.pgrb2b.0p25.f006.idx")):
+        try:
+            r = session.get(base + fname, timeout=60)
+            if r.status_code != 200:
+                log.info("idx %s -> HTTP %s", fname, r.status_code); continue
+            hits = [ln for ln in r.text.splitlines() if "SBT" in ln]
+            log.info("idx %s: %d SBT entries%s", fname, len(hits), (": " + " | ".join(h.split(":", 2)[-1][:40] for h in hits[:4])) if hits else "")
+            if any(":SBT124:" in ln for ln in hits):
+                _SBT_FILE = tag
+                return tag
+        except requests.RequestException as e:
+            log.info("idx %s failed: %s", fname, str(e)[:80])
+    _SBT_FILE = ""
+    log.warning("SBT124 not found in either GFS file listing; simulated IR disabled for this job")
+    return None
 
 
 def download_grouped(run: dt.datetime, fhr: int, pairs: set, bbox, dest: Path,
@@ -317,12 +349,25 @@ def download_grouped(run: dt.datetime, fhr: int, pairs: set, bbox, dest: Path,
         groups.setdefault(_group_of(lev), set()).add((var, lev))
     parts = []
     for name, grp in sorted(groups.items()):
+        if name in _DEAD_GROUPS:
+            continue
         part = dest.with_suffix(f".{name}.grb2")
+        url = build_filter_url(run, fhr, grp, bbox)
+        if name == "toa":
+            which = sbt_file(run, session)
+            if which is None:
+                _DEAD_GROUPS.add("toa"); continue
+            if which == "b":
+                url = url.replace("filter_gfs_0p25.pl", "filter_gfs_0p25b.pl").replace("pgrb2.0p25", "pgrb2b.0p25")
         try:
-            download(build_filter_url(run, fhr, grp, bbox), part, session, retries=retries)
+            download(url, part, session, retries=2 if name in ("toa", "pv") else retries)
             parts.append(part)
         except RuntimeError as e:
-            log.warning("f%03d group %s failed (%s): %s", fhr, name, sorted(grp)[:3], e)
+            msg = str(e)
+            log.warning("f%03d group %s failed (%s): %s", fhr, name, sorted(grp)[:3], msg[:120])
+            if "404" not in msg and name in ("toa", "pv"):
+                _DEAD_GROUPS.add(name)
+                log.warning("group %s disabled for the rest of this job", name)
     if not parts:
         raise RuntimeError(f"All download groups failed for f{fhr:03d}")
     with open(dest, "wb") as out:
@@ -480,7 +525,9 @@ def load_grib_members(path: Path, tag: str = "", bbox=None) -> dict:
                 mem = "c00" if num == 0 else f"p{num:02d}"
                 name = ec.codes_get(h, "shortName")
                 if name in ("unknown", "~", ""):
-                    name = f"p{ec.codes_get(h, 'paramId')}"
+                    # unambiguous WMO identity: discipline / category / number (see WMO_NAMES)
+                    name = f"d{ec.codes_get(h, 'discipline')}c{ec.codes_get(h, 'parameterCategory')}n{ec.codes_get(h, 'parameterNumber')}"
+                name = WMO_NAMES.get(name, name)
                 tol = ec.codes_get(h, "typeOfLevel"); lev = ec.codes_get(h, "level")
                 if tol == "isobaricInhPa":
                     key = f"{name}{int(lev)}"
@@ -656,7 +703,8 @@ def cmc_urls(run: dt.datetime, step: int, pairs: set, session: requests.Session 
         if not tok:
             continue
         token = tok.format(lev=int(lev)) if lev is not None else tok
-        urls.append(CMC_DIR.format(ymd=ymd, hh=hh, fhr=step) + CMC_FILE.format(ymd=ymd, hh=hh, token=token, fhr=step))
+        st = 0 if name == "lsm" else step          # land mask is a static field published at hour 0 only
+        urls.append(CMC_DIR.format(ymd=ymd, hh=hh, fhr=st) + CMC_FILE.format(ymd=ymd, hh=hh, token=token, fhr=st))
     return urls
 
 
@@ -888,6 +936,12 @@ class Fields(dict):
     lat: np.ndarray
 
 
+# WMO discipline/category/number -> our names, for fields eccodes labels "unknown"
+# (Environment Canada's GRIB uses templates eccodes doesn't always resolve).
+WMO_NAMES = {"d0c1n8": "tp", "d0c7n6": "cape", "d0c1n11": "snod", "d2c0n0": "lsm", "d0c0n17": "skt",
+             "d0c3n1": "prmsl", "d0c1n3": "pwat", "d0c0n0": "t", "d0c2n2": "u", "d0c2n3": "v", "d0c3n5": "gh",
+             "d0c1n1": "r", "d0c2n10": "absv", "d0c3n0": "pres", "d0c1n7": "prate", "d0c16n196": "refc"}
+
 # Names eccodes gives GFS/ECMWF fields at fixed heights -> the names plots.py uses
 HEIGHT_NAMES = {"2t": "t2m", "10u": "u10", "10v": "v10", "2r": "rh2m", "2d": "d2m", "10si": "si10"}
 
@@ -917,7 +971,9 @@ def load_grib(path: Path, tag: str = "") -> Fields:
             try:
                 name = ec.codes_get(h, "shortName")
                 if name in ("unknown", "~", ""):
-                    name = f"p{ec.codes_get(h, 'paramId')}"
+                    # unambiguous WMO identity: discipline / category / number (see WMO_NAMES)
+                    name = f"d{ec.codes_get(h, 'discipline')}c{ec.codes_get(h, 'parameterCategory')}n{ec.codes_get(h, 'parameterNumber')}"
+                name = WMO_NAMES.get(name, name)
                 tol = ec.codes_get(h, "typeOfLevel")
                 lev = ec.codes_get(h, "level")
                 step_type = ec.codes_get(h, "stepType")
