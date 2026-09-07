@@ -46,7 +46,7 @@ jobs:
           HOURS: ${{ github.event.inputs.hours }}
           FORCE: ${{ github.event.inputs.force }}
         run: |
-          ARGS="--chunks 10"
+          ARGS="--chunks 5"
           if [ -n "$HOURS" ]; then ARGS="$ARGS --hours $HOURS"; fi
           if [ "$FORCE" = "true" ]; then ARGS="$ARGS --force"; fi
           python render/check_multi.py $ARGS
