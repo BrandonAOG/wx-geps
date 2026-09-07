@@ -43,7 +43,7 @@ ENSEMBLE = MODEL.get("kind") == "ensemble"
 if ENSEMBLE:
     import ensemble  # noqa: E402
 from fetch import Fields  # noqa: E402
-from fetch import (all_fetch_pairs, build_filter_url, crop, download, download_ecmwf, download_ecmwf_ens, download_files, download_geps, download_grouped, ecmwf_pairs, gefs_member_url, load_grib_members, pack_members,
+from fetch import (all_fetch_pairs, available_pairs, build_filter_url, crop, download, download_aigefs_member, download_ecmwf, download_ecmwf_ens, download_files, download_geps, download_grouped, ecmwf_pairs, gefs_member_url, load_grib_members, pack_members,
                    latest_available_run, load_grib, merge, normalise, prev_steps, step_for,
                    synthetic_fields)  # noqa: E402
 
@@ -79,7 +79,10 @@ def render_frame(run_iso: str, fhr: int, region: str, param_ids: list[str],
     if synthetic:
         fields = synthetic_fields(fhr, padded(bbox))
     else:
-        fields = load_grib(Path(grib_paths[""]))
+        try:
+            fields = load_grib(Path(grib_paths[""]))
+        except Exception as e:  # noqa: BLE001
+            log.error("f%03d %s: data unreadable: %s", fhr, region, str(e)[:200]); return []
         for tag, path in grib_paths.items():
             if tag and path:
                 try:
@@ -301,7 +304,10 @@ def main():
             def one(m):
                 dest = grib_dir / f"{m}_f{fhr:03d}.grb2"
                 try:
-                    download(gefs_member_url(run, fhr, m, pairs, bbox), dest, session, retries=5)
+                    if MODEL["source"] == "aigefs":
+                        download_aigefs_member(run, fhr, m, dest, session)
+                    else:
+                        download(gefs_member_url(run, fhr, m, pairs, bbox), dest, session, retries=5)
                     return m, str(dest)
                 except RuntimeError as e:
                     log.warning("f%03d member %s: %s", fhr, m, e); return m, None
@@ -317,7 +323,10 @@ def main():
             files = {}
             dest = grib_dir / f"grid_f{fhr:03d}.grb2"
             try:
-                download(build_filter_url(run, fhr, pairs, None), dest, session)
+                have = available_pairs(run, fhr, pairs, session)
+                if not have:
+                    raise RuntimeError(f"f{fhr:03d}: none of the requested fields are in this file")
+                download(build_filter_url(run, fhr, have, None), dest, session)
                 files[""] = str(dest)
             except RuntimeError as e:
                 log.error("f%03d: %s", fhr, e); continue
@@ -328,7 +337,10 @@ def main():
                 tag = "_f0" if off == "f0" else f"_m{off}"
                 pdest = grib_dir / f"grid_f{step:03d}{tag}.grb2"
                 try:
-                    download(build_filter_url(run, step, spec["fetch"], None), pdest, session, retries=3)
+                    phave = available_pairs(run, step, spec["fetch"], session)
+                    if not phave:
+                        continue
+                    download(build_filter_url(run, step, phave, None), pdest, session, retries=3)
                     files[tag] = str(pdest)
                 except RuntimeError as e:
                     log.warning("%s", e)
@@ -421,7 +433,10 @@ def main():
         futs = [ex.submit(render_frame, run.isoformat(), fhr, region, args.params,
                           p, str(out_dir), args.synthetic) for fhr, region, p in jobs]
         for fut in as_completed(futs):
-            n_done += len(fut.result())
+            try:
+                n_done += len(fut.result())
+            except Exception as e:  # noqa: BLE001
+                log.error("frame failed: %s", str(e)[:200])
             if n_done % 25 == 0:
                 log.info("%d images written", n_done)
     log.info("done: %d images", n_done)
