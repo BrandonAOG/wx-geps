@@ -40,6 +40,7 @@ import storage  # noqa: E402
 from config import (FORECAST_HOURS, KEEP_RUNS, MANIFEST_NAME, MODEL, REGIONS, model_params, param_hours, products)  # noqa: E402
 PARAMS = products()  # deterministic or ensemble product table for this model
 ENSEMBLE = MODEL.get("kind") == "ensemble"
+_LOGGED_FIELDS: set = set()
 if ENSEMBLE:
     import ensemble  # noqa: E402
 from fetch import Fields  # noqa: E402
@@ -79,20 +80,22 @@ def render_frame(run_iso: str, fhr: int, region: str, param_ids: list[str],
     if synthetic:
         fields = synthetic_fields(fhr, padded(bbox))
     else:
+        win = padded(bbox) if MODEL["source"] == "nomads_grid" else None
         try:
-            fields = load_grib(Path(grib_paths[""]))
+            fields = load_grib(Path(grib_paths[""]), bbox=win)
         except Exception as e:  # noqa: BLE001
             log.error("f%03d %s: data unreadable: %s", fhr, region, str(e)[:200]); return []
         for tag, path in grib_paths.items():
             if tag and path:
                 try:
-                    fields = merge(fields, load_grib(Path(path), tag))
+                    fields = merge(fields, load_grib(Path(path), tag, bbox=win))
                 except Exception as e:  # noqa: BLE001
                     log.warning("f%03d %s: previous-step file %s unreadable: %s", fhr, region, tag, e)
         fields = crop(fields, padded(bbox))
     fields = normalise(fields, fhr)
-    if fhr == 0 and region == list(REGIONS)[0]:
-        log.info("fields available at f000: %s", " ".join(sorted(fields)))
+    if region == list(REGIONS)[0] and not _LOGGED_FIELDS:
+        _LOGGED_FIELDS.add(1)
+        log.info("fields available at f%03d: %s", fhr, " ".join(sorted(fields)))
     meta = {"run": run, "fhr": fhr, "bbox": bbox, "region": region,
             "region_name": REGIONS[region]["name"]}
     written = []
@@ -234,7 +237,7 @@ def main():
     ap.add_argument("--hours", default=None, help="e.g. 0-120/6 or 0,6,12")
     ap.add_argument("--regions", nargs="*", default=MODEL.get("regions", list(REGIONS)))
     ap.add_argument("--params", nargs="*", default=model_params())
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=MODEL.get("workers", 4))
     ap.add_argument("--synthetic", action="store_true", help="fake data, no network")
     ap.add_argument("--keep-grib", action="store_true")
     ap.add_argument("--manifest-only", action="store_true", help="write manifest for images already in site/")

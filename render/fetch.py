@@ -270,6 +270,7 @@ _IDX_LEVEL = {
     "top_of_atmosphere": "top of atmosphere", "PV=2e-06_(Km^2/kg/s)_surface": "PV=2e-06 (Km^2/kg/s) surface",
 }
 _IDX_CACHE: dict = {}
+_SKIP_LOGGED: set = set()
 
 
 def idx_url_for(run: dt.datetime, fhr: int) -> str | None:
@@ -304,15 +305,19 @@ def available_pairs(run: dt.datetime, fhr: int, pairs, session) -> set:
         except requests.RequestException as e:
             log.info("idx fetch failed (%s); requesting all fields", str(e)[:60]); return set(pairs)
     present = _IDX_CACHE[url]
+    norm = lambda t: t.replace(" (considered as a single layer)", "").strip()
+    present_n = {(v, norm(l)) for v, l in present}
     keep, dropped = set(), []
     for var, lev in pairs:
-        lev_txt = _IDX_LEVEL.get(lev, lev.replace("_", " "))
-        if (var, lev_txt) in present:
+        lev_txt = norm(_IDX_LEVEL.get(lev, lev.replace("_", " ")))
+        if (var, lev_txt) in present_n:
             keep.add((var, lev))
         else:
             dropped.append(f"{var}@{lev}")
-    if dropped and fhr in (0, 1, 6):
-        log.info("f%03d: not in this model's file, skipped: %s", fhr, " ".join(sorted(dropped)))
+    if dropped and (fhr, tuple(sorted(dropped))) not in _SKIP_LOGGED:
+        _SKIP_LOGGED.add((fhr, tuple(sorted(dropped))))
+        if len(_SKIP_LOGGED) <= 6:
+            log.info("f%03d: not in this model's file, skipped: %s", fhr, " ".join(sorted(dropped)))
     return keep
 
 
@@ -352,6 +357,29 @@ def build_filter_url(run: dt.datetime, fhr: int, pairs: set[tuple[str, str]],
 
 BACKOFF = [5, 10, 20, 30, 45, 60]
 
+# Circuit breaker: hosts that refuse connections repeatedly (per-IP rate limiting)
+# get marked dead for this process so a slice fails in minutes, not hours.
+_HOST_FAILS: dict = {}
+_DEAD_HOSTS: set = set()
+
+
+def _host(url: str) -> str:
+    return url.split("/")[2] if "//" in url else url
+
+
+def note_conn_failure(url: str):
+    h = _host(url); _HOST_FAILS[h] = _HOST_FAILS.get(h, 0) + 1
+    if _HOST_FAILS[h] >= 3 and h not in _DEAD_HOSTS:
+        _DEAD_HOSTS.add(h); log.error("%s refused %d connections in a row; giving up on it for this job", h, _HOST_FAILS[h])
+
+
+def note_conn_ok(url: str):
+    _HOST_FAILS[_host(url)] = 0
+
+
+def host_dead(url: str) -> bool:
+    return _host(url) in _DEAD_HOSTS
+
 
 def download(url: str, dest: Path, session: requests.Session, retries: int = 6) -> Path:
     """NOMADS returns 500/503 freely when busy; back off progressively."""
@@ -359,8 +387,11 @@ def download(url: str, dest: Path, session: requests.Session, retries: int = 6) 
     if dest.exists() and dest.stat().st_size > 1000:
         return dest
     for attempt in range(retries):
+        if host_dead(url):
+            raise RuntimeError(f"host unreachable: {url}")
         try:
             r = session.get(url, timeout=120)
+            note_conn_ok(url)
             if r.status_code == 200 and len(r.content) > 1000:
                 dest.write_bytes(r.content)
                 return dest
@@ -368,7 +399,8 @@ def download(url: str, dest: Path, session: requests.Session, retries: int = 6) 
                 raise RuntimeError(f"404 {url}")
             log.warning("GET %s -> %s (%d bytes), attempt %d", url[:80], r.status_code, len(r.content), attempt + 1)
         except requests.RequestException as e:
-            log.warning("GET failed (attempt %d): %s", attempt + 1, e)
+            note_conn_failure(url)
+            log.warning("GET failed (attempt %d): %s", attempt + 1, str(e)[:100])
         time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
     raise RuntimeError(f"Failed to download {url}")
 
@@ -953,16 +985,22 @@ def download_geps(run: dt.datetime, step: int, fields, dest: Path, session: requ
             for cand in candidates:
                 token = cand.format(lev=int(lev)) if lev is not None else cand
                 url = GEPS_DIR.format(ymd=ymd, hh=hh, fhr=step) + tm["file"].format(token=token, fhr=step)
-                for attempt in range(4):
+                for attempt in range(3):
+                    if host_dead(url):
+                        break
                     try:
-                        r = session.get(url, timeout=300)
+                        r = session.get(url, timeout=90)
+                        note_conn_ok(url)
                         if r.status_code == 200 and len(r.content) > 500:
                             out.write(r.content); got += 1; done = True; break
                         if r.status_code == 404:
                             break
                     except requests.RequestException as e:
+                        note_conn_failure(url)
                         log.info("GET failed (%d): %s", attempt + 1, str(e)[:80])
                     time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+                if host_dead(url):
+                    break
                 if done:
                     break
             if not done:
@@ -1061,8 +1099,11 @@ def download_files(run: dt.datetime, step: int, pairs: set, dest: Path, session:
     with open(raw, "wb") as out:
         for url in urls:
             for attempt in range(retries):
+                if host_dead(url):
+                    break
                 try:
                     r = session.get(url, timeout=60)
+                    note_conn_ok(url)
                     if r.status_code == 200 and len(r.content) > 500:
                         data = bz2.decompress(r.content) if url.endswith(".bz2") else r.content
                         out.write(data); got += 1
@@ -1071,8 +1112,11 @@ def download_files(run: dt.datetime, step: int, pairs: set, dest: Path, session:
                         log.warning("missing: %s", url.rsplit("/", 1)[-1]); break
                     log.warning("GET %s -> %s", url.rsplit("/", 1)[-1], r.status_code)
                 except (requests.RequestException, OSError) as e:
-                    log.warning("GET failed (%d): %s", attempt + 1, e)
+                    note_conn_failure(url)
+                    log.warning("GET failed (%d): %s", attempt + 1, str(e)[:100])
                 time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+            if host_dead(url):
+                break
     if got == 0:
         raw.unlink(missing_ok=True)
         raise RuntimeError(f"No fields downloaded for step {step}")
@@ -1155,7 +1199,7 @@ def _regrid_index(lats2d, lons2d, res: float):
     return _REGRID_CACHE[key]
 
 
-def load_grib(path: Path, tag: str = "") -> Fields:
+def load_grib(path: Path, tag: str = "", bbox=None) -> Fields:
     """Read every message in a GRIB file into Fields keyed so that plots can
     tell fields apart unambiguously:
 
@@ -1215,10 +1259,17 @@ def load_grib(path: Path, tag: str = "") -> Fields:
                     else:                                   # Lambert etc.: regrid to lat/lon
                         tlon, tlat, ridx, rmask, rshape = _regrid_index(lats, lons, MODEL.get("grid_res", 0.05))
                         lat, lon = tlat, tlon
+                        if bbox is not None:                # only keep the window this frame needs
+                            b0, b1, c0, c1 = bbox
+                            li = np.where((tlon >= b0) & (tlon <= b1))[0]; la = np.where((tlat >= c0) & (tlat <= c1))[0]
+                            if len(li) > 4 and len(la) > 4:
+                                sub = np.ix_(la, li)
+                                ridx = ridx.reshape(rshape)[sub].ravel(); rmask = rmask.reshape(rshape)[sub].ravel()
+                                rshape = (len(la), len(li)); lat, lon = tlat[la], tlon[li]
                 if not regular:
-                    v = vals.ravel()[ridx]; v[rmask] = np.nan; vals = v.reshape(rshape)
+                    v = vals.ravel()[ridx].astype(np.float32); v[rmask] = np.nan; vals = v.reshape(rshape)
                 if key not in out:                 # first occurrence wins (e.g. duplicate tp records)
-                    out[key] = np.asarray(vals, dtype=float)
+                    out[key] = np.asarray(vals, dtype=np.float32 if not regular else float)
             finally:
                 ec.codes_release(h)
     if lat is None:
