@@ -79,7 +79,7 @@ MODELS["ecens"] = {
 MODELS["aifsens"] = dict(MODELS["ecens"], id="aifsens", name="ECMWF AIFS ENS", source="ecmwf_aifs_ens",
                          min_age_hours=7.0, cycles=[0, 6, 12, 18], probe_max_hours=[240, 144],
                          hours=list(range(0, 241, 6)), credit="ECMWF open data AIFS-ENS (CC-BY-4.0)")
-MODELS["aigefs"] = dict(MODELS["gefs"], id="aigefs", name="AI-GEFS", source="aigefs", credit="NOAA/NCEP AIGEFS via NOMADS",
+MODELS["aigefs"] = dict(MODELS["gefs"], id="aigefs", name="AI-GEFS", resolution="0.25°", source="aigefs", credit="NOAA/NCEP AIGEFS via NOMADS",
                         min_age_hours=4.0, hours=list(range(0, 241, 6)), probe_max_hours=[240, 120],
                         # NOMADS layout (no grib_filter): fields are byte-ranged out of each member's file via its .idx
                         path="https://nomads.ncep.noaa.gov/pub/data/nccf/com/aigefs/v1.0/aigefs.{ymd}/{hh}/mem{mem:03d}/model/atmos/grib2/aigefs.t{hh}z.pres.f{fhr:03d}.grib2",
@@ -420,6 +420,19 @@ ENS_PARAMS = {
     "prob_mslp1000": {"name": "Prob. MSLP ≤ 1000 mb",         "group": "Probability",   "plot": "prob_mslp1000", "fetch": _ENS_FETCH},
     "prob_t850frz":  {"name": "Prob. 850 mb temp ≤ 0 °C",     "group": "Probability",   "plot": "prob_t850frz",  "fetch": _ENS_FETCH},
 }
+
+# Cities whose values get printed on the 2 m temperature and 10 m wind maps
+# (only on the Florida / Gulf / Southeast views, where the labels fit).
+LABEL_CITIES = [
+    ("Miami", 25.76, -80.19), ("West Palm Beach", 26.71, -80.05), ("Key West", 24.56, -81.78),
+    ("Naples", 26.14, -81.79), ("Fort Myers", 26.64, -81.87), ("Sarasota", 27.34, -82.53),
+    ("Tampa", 27.95, -82.46), ("Orlando", 28.54, -81.38), ("Daytona Beach", 29.21, -81.02), ("Jacksonville", 30.33, -81.66),
+    ("Tallahassee", 30.44, -84.28), ("Panama City", 30.16, -85.66), ("Pensacola", 30.42, -87.22),
+    ("Mobile", 30.69, -88.04), ("New Orleans", 29.95, -90.07), ("Houston", 29.76, -95.37), ("Corpus Christi", 27.80, -97.40),
+    ("Brownsville", 25.90, -97.50), ("Atlanta", 33.75, -84.39), ("Savannah", 32.08, -81.10), ("Charleston", 32.78, -79.93),
+    ("Nassau", 25.05, -77.35), ("Havana", 23.13, -82.38), ("Cancún", 21.16, -86.85),
+]
+LABEL_REGIONS = {"fl", "gulf", "seast"}
 
 # Output image size (inches × dpi)
 FIG_SIZE = (12, 8)
